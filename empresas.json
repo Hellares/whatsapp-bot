@@ -1,0 +1,8 @@
+[
+  {
+    "id": "empresa-1",
+    "nombre": "Tienda Perú",
+    "whatsapp": "+51901168935",
+    "sesionPath": "./sessions/empresa-1"
+  }
+]
