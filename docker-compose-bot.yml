@@ -1,0 +1,34 @@
+services:
+  whatsapp-bot:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-bot
+    ports:
+      - "3034:3034"
+    environment:
+      - NODE_ENV=production
+      - PORT=3034
+      - N8N_WEBHOOK_URL=http://n8n-server:5678
+      - LOG_LEVEL=info
+      - TZ=America/Lima
+    
+    volumes:
+      - whatsapp_sessions:/app/sessions
+      - whatsapp_logs:/app/logs
+      - ./empresas.json:/app/empresas.json:ro
+    
+    networks:
+      - elastika-network
+    
+    restart: unless-stopped
+
+volumes:
+  whatsapp_sessions:
+    driver: local
+  whatsapp_logs:
+    driver: local
+
+networks:
+  elastika-network:
+    external: true
