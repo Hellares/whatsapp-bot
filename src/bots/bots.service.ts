@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -22,15 +22,16 @@ interface Empresa {
 
 @Injectable()
 export class BotsService implements OnModuleInit {
+  private readonly logger = new Logger(BotsService.name);
   private bots = new Map<string, ReturnType<typeof makeWASocket>>();
   private connectionAttempts = new Map<string, number>();
   private readonly MAX_RECONNECT_ATTEMPTS = 5;
-  private readonly RECONNECT_INTERVAL = 5000; // 5 segundos
-  private readonly CONNECTION_TIMEOUT = 60000; // 60 segundos
+  private readonly RECONNECT_INTERVAL = 5000;
+  private readonly CONNECTION_TIMEOUT = 60000;
+  private readonly N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_BASE || 'http://n8n-server:5678/webhook';
 
   async onModuleInit() {
     try {
-      // Limpiar sesiones antiguas al iniciar
       await this.limpiarSesionesAntiguas();
       
       const empresas = await this.obtenerEmpresas();
@@ -39,10 +40,10 @@ export class BotsService implements OnModuleInit {
           await this.iniciarBot(empresa);
         }
       } else {
-        console.error('No se encontraron empresas para iniciar');
+        this.logger.error('No se encontraron empresas para iniciar');
       }
     } catch (error) {
-      console.error('Error al iniciar los bots:', error);
+      this.logger.error('Error al iniciar los bots:', error);
     }
   }
 
@@ -54,11 +55,8 @@ export class BotsService implements OnModuleInit {
         for (const empresa of empresas) {
           const empresaDir = path.join(sessionsDir, empresa.id);
           if (fs.existsSync(empresaDir)) {
-            // Mantener solo los archivos de sesión más recientes
             const archivos = fs.readdirSync(empresaDir);
             const sesionesActivas = new Set<string>();
-            
-            // Mantener solo las últimas 10 sesiones por chat
             const sesionesPorChat = new Map<string, string[]>();
             
             archivos.forEach(archivo => {
@@ -71,14 +69,12 @@ export class BotsService implements OnModuleInit {
               }
             });
 
-            // Mantener solo las últimas 10 sesiones por chat
             sesionesPorChat.forEach((sesiones, chatId) => {
               sesiones.sort().reverse().slice(0, 10).forEach(sesion => {
                 sesionesActivas.add(sesion);
               });
             });
 
-            // Eliminar archivos antiguos
             archivos.forEach(archivo => {
               if (archivo.startsWith('session-') && !sesionesActivas.has(archivo)) {
                 fs.unlinkSync(path.join(empresaDir, archivo));
@@ -88,7 +84,7 @@ export class BotsService implements OnModuleInit {
         }
       }
     } catch (error) {
-      console.error('Error al limpiar sesiones antiguas:', error);
+      this.logger.error('Error al limpiar sesiones antiguas:', error);
     }
   }
 
@@ -96,7 +92,7 @@ export class BotsService implements OnModuleInit {
     try {
       return empresasData;
     } catch (error) {
-      console.error('Error al obtener empresas:', error);
+      this.logger.error('Error al obtener empresas:', error);
       return [];
     }
   }
@@ -105,9 +101,79 @@ export class BotsService implements OnModuleInit {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  // Nuevo método: Enviar mensaje a N8N
+  private async enviarMensajeAN8N(empresaId: string, data: {
+    mensaje: string;
+    telefono: string;
+    empresaId: string;
+    timestamp: number;
+  }): Promise<void> {
+    try {
+      const webhookUrl = `${this.N8N_WEBHOOK_URL}/empresa-${empresaId}`;
+      
+      this.logger.debug(`Enviando mensaje a N8N: ${webhookUrl}`);
+      
+      const response = await axios.post(webhookUrl, data, {
+        timeout: 10000,
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'WhatsApp-Bot-Service'
+        }
+      });
+
+      this.logger.log(`Mensaje enviado a N8N exitosamente para empresa ${empresaId}`);
+      
+    } catch (error) {
+      this.logger.error(`Error enviando mensaje a N8N para empresa ${empresaId}:`, error.message);
+      
+      // Fallback: Si N8N no está disponible, procesar localmente
+      await this.procesarMensajeLocal(empresaId, data);
+    }
+  }
+
+  // Método fallback para procesar mensajes localmente
+  private async procesarMensajeLocal(empresaId: string, data: {
+    mensaje: string;
+    telefono: string;
+    empresaId: string;
+  }): Promise<void> {
+    const sock = this.bots.get(empresaId);
+    if (!sock) return;
+
+    const { mensaje, telefono } = data;
+    
+    if (mensaje.startsWith('!')) {
+      const comando = mensaje.slice(1).trim().toLowerCase();
+      
+      let respuesta = '';
+      
+      if (comando === 'ayuda' || comando === 'help') {
+        respuesta = `🤖 *Comandos disponibles (Modo local):*
+• *!estado [número]* - Consulta el estado de un pedido
+• *!ayuda* - Muestra este mensaje
+• *!info* - Información de la tienda
+• *!horario* - Horarios de atención
+
+*Nota:* N8N no disponible, funcionando en modo local.`;
+      } else if (comando === 'info') {
+        const empresa = empresasData.find(e => e.id === empresaId);
+        respuesta = `🏪 *${empresa?.nombre || 'Empresa'}*
+📱 WhatsApp: ${empresa?.whatsapp || 'No disponible'}
+
+¡Gracias por contactarnos! 😊`;
+      } else {
+        respuesta = `❓ Comando no reconocido. Escribe *!ayuda* para ver comandos disponibles.
+        
+*Nota:* Sistema funcionando en modo local.`;
+      }
+      
+      await this.enviarMensaje(sock, telefono, respuesta);
+    }
+  }
+
   async iniciarBot(empresa: Empresa) {
     if (this.bots.has(empresa.id)) {
-      console.log(`[${empresa.nombre}] Bot ya iniciado`);
+      this.logger.log(`[${empresa.nombre}] Bot ya iniciado`);
       return;
     }
 
@@ -168,7 +234,7 @@ export class BotsService implements OnModuleInit {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-          console.log(`\n[${empresa.nombre}] Escanea el código QR para iniciar sesión:`);
+          this.logger.log(`\n[${empresa.nombre}] Escanea el código QR para iniciar sesión:`);
           qrcode.generate(qr, { small: true });
           this.connectionAttempts.set(empresa.id, 0);
         }
@@ -178,12 +244,12 @@ export class BotsService implements OnModuleInit {
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           const attempts = (this.connectionAttempts.get(empresa.id) || 0) + 1;
           
-          console.log(`[${empresa.nombre}] Conexión cerrada debido a ${lastDisconnect?.error}, intento ${attempts} de ${this.MAX_RECONNECT_ATTEMPTS}`);
+          this.logger.log(`[${empresa.nombre}] Conexión cerrada debido a ${lastDisconnect?.error}, intento ${attempts} de ${this.MAX_RECONNECT_ATTEMPTS}`);
           
           if (shouldReconnect && attempts <= this.MAX_RECONNECT_ATTEMPTS) {
             this.connectionAttempts.set(empresa.id, attempts);
             const delay = Math.min(1000 * Math.pow(2, attempts), 30000);
-            console.log(`[${empresa.nombre}] Intentando reconectar en ${delay/1000} segundos...`);
+            this.logger.log(`[${empresa.nombre}] Intentando reconectar en ${delay/1000} segundos...`);
             
             try {
               await this.esperar(delay);
@@ -196,15 +262,15 @@ export class BotsService implements OnModuleInit {
               }
               await this.iniciarBot(empresa);
             } catch (error) {
-              console.error(`[${empresa.nombre}] Error durante la reconexión:`, error);
+              this.logger.error(`[${empresa.nombre}] Error durante la reconexión:`, error);
             }
           } else if (attempts > this.MAX_RECONNECT_ATTEMPTS) {
-            console.error(`[${empresa.nombre}] Se alcanzó el máximo número de intentos de reconexión`);
+            this.logger.error(`[${empresa.nombre}] Se alcanzó el máximo número de intentos de reconexión`);
             this.bots.delete(empresa.id);
             this.connectionAttempts.delete(empresa.id);
           }
         } else if (connection === 'open') {
-          console.log(`[${empresa.nombre}] Bot conectado exitosamente`);
+          this.logger.log(`[${empresa.nombre}] Bot conectado exitosamente`);
           this.connectionAttempts.delete(empresa.id);
         }
       });
@@ -212,63 +278,37 @@ export class BotsService implements OnModuleInit {
       // Guardar credenciales cuando se actualicen
       sock.ev.on('creds.update', saveCreds);
 
-      // Manejar mensajes
+      // NUEVO: Manejar mensajes - Enviar a N8N
       sock.ev.on('messages.upsert', async (msg) => {
         const m = msg.messages[0];
         const texto = m.message?.conversation;
         const sender = m.key.remoteJid;
 
-        //? Solo responder si el mensaje comienza con '!'
-
-        if (!m.key.fromMe && texto && texto.startsWith('/')) {
-          const comando = texto.slice(1).trim();
-          // Comando de estado
-          if (comando.startsWith('estado')) {
-            const pedidoId = comando.split(' ')[1];
-            try {
-              const response = await axios.get(
-                `http://localhost:3000/empresas/${empresa.id}/pedidos/${pedidoId}`,
-              );
-              const { estado } = response.data;
-
-              await this.enviarMensaje(sock, sender, `📦 Estado del pedido ${pedidoId}: ${estado}`);
-            } catch (e) {
-              await this.enviarMensaje(sock, sender, `❌ No encontré el pedido ${pedidoId}`);
-            }
-          }
-          // Comando de ayuda
-          else if (comando.toLowerCase() === 'ayuda' || comando.toLowerCase() === 'help') {
-            const mensajeAyuda = `🤖 *Comandos disponibles:*
-• *!estado [número]* - Consulta el estado de un pedido
-• *!ayuda* - Muestra este mensaje de ayuda
-• *!info* - Muestra información de la tienda
-
-Para más información, contacta a soporte.`;
-            await this.enviarMensaje(sock, sender, mensajeAyuda);
-          }
-          // Comando de información
-          else if (comando.toLowerCase() === 'info') {
-            const mensajeInfo = `🏪 *${empresa.nombre}*
-📱 WhatsApp: ${empresa.whatsapp}
-⏰ Horario de atención: Lunes a Sábado de 9:00 a 18:00
-
-¡Gracias por contactarnos! 😊`;
-            await this.enviarMensaje(sock, sender, mensajeInfo);
-          }
-          // Mensaje por defecto para comandos desconocidos
-          else {
-            await this.enviarMensaje(sock, sender, `Comando no reconocido. Escribe *!ayuda* para ver los comandos disponibles.`);
+        // Solo procesar mensajes que no sean nuestros
+        if (!m.key.fromMe && texto) {
+          this.logger.debug(`[${empresa.nombre}] Mensaje recibido de ${sender}: ${texto}`);
+          
+          try {
+            // Enviar a N8N para procesamiento
+            await this.enviarMensajeAN8N(empresa.id, {
+              mensaje: texto,
+              telefono: sender,
+              empresaId: empresa.id,
+              timestamp: Date.now()
+            });
+          } catch (error) {
+            this.logger.error(`[${empresa.nombre}] Error procesando mensaje:`, error);
           }
         }
       });
 
-      console.log(`[${empresa.nombre}] Bot iniciado correctamente`);
+      this.logger.log(`[${empresa.nombre}] Bot iniciado correctamente`);
     } catch (error) {
-      console.error(`Error al iniciar bot para ${empresa.nombre}:`, error);
+      this.logger.error(`Error al iniciar bot para ${empresa.nombre}:`, error);
       const attempts = (this.connectionAttempts.get(empresa.id) || 0) + 1;
       if (attempts <= this.MAX_RECONNECT_ATTEMPTS) {
         this.connectionAttempts.set(empresa.id, attempts);
-        console.log(`[${empresa.nombre}] Intentando reconectar después del error...`);
+        this.logger.log(`[${empresa.nombre}] Intentando reconectar después del error...`);
         await this.esperar(this.RECONNECT_INTERVAL);
         await this.iniciarBot(empresa);
       }
@@ -278,8 +318,34 @@ Para más información, contacta a soporte.`;
   private async enviarMensaje(sock: ReturnType<typeof makeWASocket>, to: string, text: string) {
     try {
       await sock.sendMessage(to, { text });
+      this.logger.debug(`Mensaje enviado a ${to}`);
     } catch (error) {
-      console.error('Error al enviar mensaje:', error);
+      this.logger.error('Error al enviar mensaje:', error);
+    }
+  }
+
+  // NUEVO: Método para que N8N envíe respuestas al bot
+  async enviarRespuestaDesdeN8N(empresaId: string, telefono: string, respuesta: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const sock = this.bots.get(empresaId);
+      if (!sock) {
+        throw new Error(`Bot no encontrado para empresa ${empresaId}`);
+      }
+
+      await this.enviarMensaje(sock, telefono, respuesta);
+      
+      this.logger.log(`[${empresaId}] Respuesta de N8N enviada a ${telefono}`);
+      
+      return { 
+        success: true, 
+        message: 'Respuesta enviada correctamente desde N8N' 
+      };
+    } catch (error) {
+      this.logger.error(`Error enviando respuesta desde N8N:`, error);
+      return { 
+        success: false, 
+        message: error.message 
+      };
     }
   }
 
@@ -292,7 +358,7 @@ Para más información, contacta a soporte.`;
       await this.enviarMensaje(sock, to, text);
       return { success: true, message: 'Mensaje enviado correctamente' };
     } catch (error) {
-      console.error('Error al enviar mensaje por empresa ID:', error);
+      this.logger.error('Error al enviar mensaje por empresa ID:', error);
       return { success: false, error: 'Error al enviar el mensaje' };
     }
   }
@@ -309,9 +375,21 @@ Para más información, contacta a soporte.`;
       await this.iniciarBot(empresa);
       return { message: `Bot iniciado para ${empresa.nombre}` };
     } catch (error) {
-      console.error('Error al iniciar bot por empresa ID:', error);
+      this.logger.error('Error al iniciar bot por empresa ID:', error);
       return { error: 'Error al iniciar el bot' };
     }
   }
-}
 
+  // NUEVO: Método para obtener estado del bot
+  obtenerEstadoBot(empresaId: string) {
+    const botExiste = this.bots.has(empresaId);
+    const intentosReconexion = this.connectionAttempts.get(empresaId) || 0;
+    
+    return {
+      empresaId,
+      activo: botExiste,
+      intentosReconexion,
+      timestamp: new Date().toISOString()
+    };
+  }
+}

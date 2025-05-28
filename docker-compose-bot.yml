@@ -10,6 +10,7 @@ services:
       - NODE_ENV=production
       - PORT=3034
       - N8N_WEBHOOK_URL=http://n8n-server:5678
+      - N8N_WEBHOOK_BASE=http://n8n-server:5678/webhook
       - LOG_LEVEL=info
       - TZ=America/Lima
     
